@@ -187,7 +187,7 @@ See **Section 5** of the report for the full list of engineering issues (depende
 | Name | Role |
 |---|---|
 | **Kunal Gaurav** | Retrieval pipeline, retriever training, RAG inference, evaluation |
-| **Priyanshu Chakraborty** | Co-contributor |
+| **Priyanshu Chakraborty** | Co-contributor, LLM Report Generation + Datasets |
 | **Dr. Mehul, Dr. Suneel** | Guidance (IIIT Bhagalpur, CSE Department) |
 
 ---
