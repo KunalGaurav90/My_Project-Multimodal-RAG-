@@ -1,0 +1,194 @@
+# ============================================================
+# CELL 12 — INTERACTIVE USER UPLOAD: IMAGE + QUESTION → ANSWER
+# User uploads ANY MRI image (not restricted to dataset folder)
+# and types a free-text question. Pipeline retrieves relevant
+# KG context, reranks using the uploaded image, and generates
+# an answer with LLaVA-Med.
+#
+# Must run AFTER the Cell 9 block (retriever, kg_matrix,
+# knowledge_graph, tokenizer, llava_model, image_processor,
+# biomed_tokenizer, biomed_preprocess, build_prompt,
+# format_chunk_for_prompt, rerank_multimodal must already exist).
+# ============================================================
+
+import os, io, torch
+from PIL import Image
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+from llava.mm_utils import tokenizer_image_token, process_images
+
+
+def answer_from_image(image_pil, question, k=8, top_n=3, max_new_tokens=150):
+    """Core inference: takes a PIL image + question, returns the model's answer."""
+    image_pil = image_pil.convert('RGB')
+
+    # ── Retrieval using the question text (no answer-leak) ──
+    tok = biomed_tokenizer(
+        question, return_tensors='pt', max_length=256,
+        padding='max_length', truncation=True
+    )['input_ids'].to(device)
+    with torch.no_grad():
+        q_emb = retriever.encode_text(tok).cpu()
+    sims = torch.nn.functional.cosine_similarity(q_emb, kg_matrix, dim=-1)
+    top_indices = sims.topk(min(k, len(sims))).indices.tolist()
+
+    # ── Rerank using the actual uploaded image (multimodal) ──
+    final_idx = rerank_multimodal(question, image_pil, top_indices)
+    retrieved_entities = [knowledge_graph[i].get('entity', '') for i in final_idx]
+    chunks = [format_chunk_for_prompt(knowledge_graph[i]) for i in final_idx[:top_n]]
+
+    # ── Build prompt ──
+    cur_prompt = build_prompt(question, chunks)
+    full_question = DEFAULT_IMAGE_TOKEN + '\n' + cur_prompt
+
+    conv = conv_templates['mistral_instruct'].copy()
+    conv.append_message(conv.roles[0], full_question)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+
+    input_ids = tokenizer_image_token(
+        prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
+    ).unsqueeze(0).cuda()
+    attention_mask = torch.ones_like(input_ids)
+
+    image_tensor = process_images([image_pil], image_processor, llava_model.config)
+    if isinstance(image_tensor, list):
+        image_tensor = torch.stack(image_tensor)
+    image_tensor = image_tensor.half().cuda()
+
+    with torch.inference_mode():
+        output_ids = llava_model.generate(
+            input_ids,
+            images=image_tensor,
+            attention_mask=attention_mask,
+            do_sample=False,
+            num_beams=1,
+            max_new_tokens=max_new_tokens,
+            use_cache=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    pred = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    return pred, retrieved_entities
+
+
+# ============================================================
+# Interactive widget UI
+# ============================================================
+upload_widget = widgets.FileUpload(
+    accept='image/*',
+    multiple=False,
+    description='Upload MRI image'
+)
+
+question_widget = widgets.Text(
+    value='',
+    placeholder='Type your question about the image...',
+    description='Question:',
+    layout=widgets.Layout(width='600px')
+)
+
+submit_button = widgets.Button(
+    description='Ask',
+    button_style='success'
+)
+
+output_area     = widgets.Output()   # image + all Q&A history (never auto-cleared)
+controls_area   = widgets.Output()   # only the Yes/No buttons / next-question box
+
+# Holds the currently uploaded image across follow-up questions
+session_state = {'image_pil': None}
+
+
+def run_qa(image_pil, question):
+    """Run inference and print results into output_area (persists, never cleared)."""
+    with output_area:
+        print(f'❓ Question: {question}')
+        print('⏳ Running inference...\n')
+
+        pred, retrieved_entities = answer_from_image(image_pil, question)
+
+        print(f'🔎 Retrieved context from: {retrieved_entities}')
+        print(f'\n💬 Answer:\n{pred}\n')
+        print('-' * 60)
+
+
+def ask_followup():
+    """Display Yes/No buttons in controls_area (this one IS safe to clear,
+    since it never holds the answer text)."""
+    controls_area.clear_output(wait=True)
+
+    yes_button = widgets.Button(description='Yes', button_style='info')
+    no_button  = widgets.Button(description='No', button_style='')
+
+    with controls_area:
+        print('🔁 Any more questions about this image?')
+        display(widgets.HBox([yes_button, no_button]))
+
+    def on_yes(b):
+        controls_area.clear_output(wait=True)
+        with controls_area:
+            new_q_widget = widgets.Text(
+                value='',
+                placeholder='Type your next question...',
+                description='Question:',
+                layout=widgets.Layout(width='600px')
+            )
+            ask_again_button = widgets.Button(description='Ask', button_style='success')
+            display(widgets.HBox([new_q_widget, ask_again_button]))
+
+            def on_ask_again(b):
+                if not new_q_widget.value.strip():
+                    return
+                controls_area.clear_output(wait=True)   # clear the input box only
+                run_qa(session_state['image_pil'], new_q_widget.value.strip())  # answer goes to output_area, persists
+                ask_followup()   # show Yes/No again in controls_area
+
+            ask_again_button.on_click(on_ask_again)
+
+    def on_no(b):
+        controls_area.clear_output(wait=True)
+        with controls_area:
+            print('🙏 Thank you! Glad I could help.')
+
+    yes_button.on_click(on_yes)
+    no_button.on_click(on_no)
+
+
+def on_submit_clicked(b):
+    with output_area:
+        clear_output(wait=True)
+
+        if len(upload_widget.value) == 0:
+            print('❌ Please upload an image first.')
+            return
+        if not question_widget.value.strip():
+            print('❌ Please type a question.')
+            return
+
+        # Extract uploaded image bytes (works for both ipywidgets v7 and v8 formats)
+        uploaded = upload_widget.value
+        if isinstance(uploaded, dict):
+            file_info = list(uploaded.values())[0]
+            img_bytes = file_info['content']
+        else:  # tuple format (ipywidgets >= 8)
+            file_info = uploaded[0]
+            img_bytes = file_info['content']
+
+        image_pil = Image.open(io.BytesIO(img_bytes))
+        session_state['image_pil'] = image_pil  # keep for follow-up questions
+
+        print('🖼️  Image uploaded successfully')
+        display(image_pil.resize((300, 300)))
+
+    run_qa(image_pil, question_widget.value.strip())
+    ask_followup()
+
+
+submit_button.on_click(on_submit_clicked)
+
+print('Upload an MRI image, type your question, then click "Ask".\n')
+display(upload_widget, question_widget, submit_button, output_area, controls_area)
