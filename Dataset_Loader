@@ -1,0 +1,207 @@
+# ============================================================
+# CUSTOM DATASET CLASS FOR MERGED_REPORTS.JSON
+# ============================================================
+import json
+import os
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+import numpy as np
+
+class MedicalReportDataset(Dataset):
+    def __init__(self, json_path, images_dir, preprocess, tokenizer, max_text_len=256):
+        self.json_path = json_path
+        self.images_dir = images_dir
+        self.preprocess = preprocess
+        self.tokenizer = tokenizer
+        self.max_text_len = max_text_len
+        
+        with open(json_path, 'r') as f:
+            self.data = json.load(f)
+        
+        self.image_to_idx = {entry.get('image', ''): idx for idx, entry in enumerate(self.data)}
+        print(f"✅ Loaded {len(self.data)} medical entries")
+        print(f"✅ Found {len(self.image_to_idx)} images mapped")
+        
+        self.query_fields = ['cause', 'symptom', 'treatment']
+        self.context_fields = ['description', 'chunk', 'prevention']
+        self.qa_pairs = []
+        self._create_qa_pairs()
+    
+    def _create_qa_pairs(self):
+        for idx, entry in enumerate(self.data):
+            entity = entry.get('entity', 'Unknown Disease')
+            for qf in self.query_fields:
+                qtext = entry.get(qf, '')
+                if not qtext:
+                    continue
+                for cf in self.context_fields:
+                    ctext = entry.get(cf, '')
+                    if not ctext:
+                        continue
+                    self.qa_pairs.append({
+                        'query_field': qf, 'query_text': qtext,
+                        'context_field': cf, 'context_text': ctext,
+                        'entity': entity, 'image_idx': idx,
+                        'image_name': entry.get('image', '')
+                    })
+        print(f"✅ Created {len(self.qa_pairs)} Q&A pairs")
+    
+    def __len__(self):
+        return len(self.qa_pairs)
+    
+    def __getitem__(self, idx):
+        pair = self.qa_pairs[idx]
+        query_prompt = f"{pair['query_field'].upper()}: {pair['query_text']}"
+        pos_text = f"{pair['entity']}. {pair['context_text']}"
+        
+        neg_idx = np.random.randint(0, len(self.data))
+        while neg_idx == pair['image_idx']:
+            neg_idx = np.random.randint(0, len(self.data))
+        neg_entry = self.data[neg_idx]
+        neg_text = f"{neg_entry.get('entity', 'Unknown')}. {neg_entry.get('description', '')}"
+        
+        def tokenize(text):
+            # open_clip's HFTokenizer wrapper only accepts `texts` and
+            # `context_length` — it does NOT accept the raw HuggingFace
+            # kwargs (max_length/truncation/padding/return_tensors).
+            # It handles truncation/padding internally and always
+            # returns a [batch, seq_len] tensor of input_ids.
+            return self.tokenizer([text], context_length=self.max_text_len).squeeze(0)
+        query_ids = tokenize(query_prompt)
+        pos_ids = tokenize(pos_text)
+        neg_ids = tokenize(neg_text)
+        
+        img_path = os.path.join(self.images_dir, pair['image_name'])
+        if not os.path.exists(img_path):
+            query_image = torch.zeros(3, 224, 224)
+        else:
+            try:
+                image = Image.open(img_path).convert('RGB')
+                query_image = self.preprocess(image)
+            except Exception:
+                query_image = torch.zeros(3, 224, 224)
+        
+        return {
+            'query_ids': query_ids,
+            'query_image': query_image,
+            'pos_ids': pos_ids,
+            'neg_ids': neg_ids,
+        }
+    
+    def get_entry_info(self, idx):
+        if idx >= len(self.data):
+            return None
+        entry = self.data[idx]
+        return {
+            'entity': entry.get('entity'),
+            'location': entry.get('location'),
+            'image': entry.get('image'),
+            'description': entry.get('description', '')[:200] + '...',
+            'symptoms': entry.get('symptom', '')[:200] + '...',
+            'treatment': entry.get('treatment', '')[:200] + '...',
+        }
+
+
+# ============================================================
+# TEST – with dynamic monkey‑patching (safe and version‑agnostic)
+# ============================================================
+if __name__ == '__main__':
+    import sys
+    import subprocess
+    import os
+    import inspect
+
+    # -----------------------------------------------------------------
+    # 1. Install open_clip_torch if missing
+    # -----------------------------------------------------------------
+    try:
+        import open_clip
+    except ImportError:
+        print("📦 Installing open_clip_torch...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "open_clip_torch"])
+        import open_clip
+
+    # -----------------------------------------------------------------
+    # 2. Monkey‑patch 1: fake the 'clvp' module to avoid import error
+    # -----------------------------------------------------------------
+    from types import ModuleType
+    if 'transformers.models.clvp' not in sys.modules:
+        sys.modules['transformers.models.clvp'] = ModuleType('clvp')
+
+    # -----------------------------------------------------------------
+    # 3. Monkey‑patch 2: dynamically filter unknown kwargs for CLIPTextCfg
+    #    (this automatically ignores hf_proj_type, hf_pooler_type, etc.)
+    #    Guarded so re-running this cell doesn't wrap the already-
+    #    patched __init__ again (that caused RecursionError).
+    # -----------------------------------------------------------------
+    from open_clip import CLIPTextCfg
+
+    if not getattr(CLIPTextCfg.__init__, '_is_patched', False):
+        _orig_init = CLIPTextCfg.__init__
+        _sig = inspect.signature(_orig_init)
+
+        def _patched_init(self, **kwargs):
+            # Keep only arguments that are accepted by the original __init__
+            filtered = {k: v for k, v in kwargs.items() if k in _sig.parameters}
+            _orig_init(self, **filtered)
+
+        _patched_init._is_patched = True
+        CLIPTextCfg.__init__ = _patched_init
+
+    # -----------------------------------------------------------------
+    # 4. Monkey-patch 3: strip 'position_ids' from checkpoint state_dict
+    #    (newer transformers register position_ids as a non-persistent
+    #    buffer, so old checkpoints that saved it trigger a spurious
+    #    "Unexpected key(s) in state_dict: text.transformer.embeddings.
+    #    position_ids" RuntimeError on load_state_dict with strict=True)
+    # -----------------------------------------------------------------
+    import open_clip.factory as _factory
+
+    _orig_load_state_dict_fn = _factory.load_state_dict
+
+    def _patched_load_state_dict_fn(checkpoint_path, map_location='cpu'):
+        sd = _orig_load_state_dict_fn(checkpoint_path, map_location)
+        sd = {k: v for k, v in sd.items() if 'position_ids' not in k}
+        return sd
+
+    _factory.load_state_dict = _patched_load_state_dict_fn
+
+    # -----------------------------------------------------------------
+    # 5. Patch missing utility functions (just in case)
+    # -----------------------------------------------------------------
+    try:
+        from transformers.utils import is_torch_mlu_available
+    except ImportError:
+        import transformers.utils
+        transformers.utils.is_torch_mlu_available = lambda: False
+
+    # -----------------------------------------------------------------
+    # 6. Load BiomedCLIP via open_clip
+    # -----------------------------------------------------------------
+    model, _, biomed_preprocess = open_clip.create_model_and_transforms(
+        'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+    )
+    bio_tokenizer = open_clip.get_tokenizer('hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224')
+
+    BASE_INPUT = '/kaggle/input/datasets/ravvkunn09'
+    MY_IMGS = os.path.join(BASE_INPUT, 'imagyy')
+    MY_PATH = os.path.join(BASE_INPUT, 'm-report', 'merged_u.json')
+
+    print("=" * 80)
+    print("TESTING MedicalReportDataset")
+    print("=" * 80)
+
+    dataset = MedicalReportDataset(MY_PATH, MY_IMGS, biomed_preprocess, bio_tokenizer)
+
+    print("\n📋 Sample batch:")
+    for i in range(min(3, len(dataset))):
+        sample = dataset[i]
+        print(f"\n  Sample {i+1}:")
+        print(f"    Query IDs shape: {sample['query_ids'].shape}")
+        print(f"    Query Image shape: {sample['query_image'].shape}")
+        print(f"    Pos IDs shape: {sample['pos_ids'].shape}")
+        print(f"    Neg IDs shape: {sample['neg_ids'].shape}")
+
+    print(f"\n✅ Dataset test passed!")
+    print("=" * 80)
