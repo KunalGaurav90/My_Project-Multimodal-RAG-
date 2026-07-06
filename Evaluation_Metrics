@@ -1,0 +1,83 @@
+# ============================================================
+# CELL 10 — EVALUATION METRICS (MODIFIED FOR MERGED_REPORTS RESULTS)
+# Exact Match, F1, Precision, Recall, BLEU-1/2/3/4
+# No answer_type field in this dataset — every sample treated as OPEN
+# ============================================================
+import re, math
+from collections import defaultdict
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from tabulate import tabulate
+
+def normalize_word(text):
+    return re.sub(r'[^a-z0-9 ]', '', text.lower().strip())
+
+def calculate_exactmatch(pred, gt):
+    return 1.0 if normalize_word(pred) == normalize_word(gt) else 0.0
+
+def calculate_f1score(pred, gt):
+    pred_t = normalize_word(pred).split()
+    gt_t   = normalize_word(gt).split()
+    if not pred_t or not gt_t:
+        return 0.0, 0.0, 0.0
+    common = set(pred_t) & set(gt_t)
+    if not common:
+        return 0.0, 0.0, 0.0
+    prec = len(common) / len(pred_t)
+    rec  = len(common) / len(gt_t)
+    f1   = 2 * prec * rec / (prec + rec)
+    return f1, prec, rec
+
+smoother     = SmoothingFunction().method1
+exact_scores = []
+f1_scores    = []
+prec_scores  = []
+rec_scores   = []
+bleu_scores  = defaultdict(list)
+open_hits2   = []
+
+# Using 'entity' as ground truth for matching (diagnosis name), since
+# 'gt_answer' is a long free-text description and exact/F1/BLEU against
+# that will be near-zero by design. Swap to item['gt_answer'] if you
+# want metrics against the full description instead.
+for item in results:
+    pred = item.get('prediction_clean', item['prediction'])  # ← use cleaned diagnosis
+    gt   = item.get('entity', item['gt_answer'])  # ← entity name as gt
+
+    pn = normalize_word(pred)
+    gn = normalize_word(gt)
+
+    exact_scores.append(calculate_exactmatch(pn, gn))
+    f1, prec, rec = calculate_f1score(pn, gn)
+    f1_scores.append(f1)
+    prec_scores.append(prec)
+    rec_scores.append(rec)
+
+    ref = gn.split()
+    hyp = pn.split()
+    if ref and hyp:
+        for n, w in [(1,(1,0,0,0)),(2,(0,1,0,0)),
+                     (3,(0,0,1,0)),(4,(0,0,0,1))]:
+            bleu_scores[n].append(
+                sentence_bleu([ref], hyp, weights=w,
+                              smoothing_function=smoother))
+    open_hits2.append(1.0 if gn in pn else 0.0)
+
+def safe_mean(lst): return sum(lst)/len(lst) if lst else 0.0
+
+table = [
+    ['Exact Match',  f'{safe_mean(exact_scores)*100:.2f}%'],
+    ['F1 Score',     f'{safe_mean(f1_scores)*100:.2f}%'],
+    ['Precision',    f'{safe_mean(prec_scores)*100:.2f}%'],
+    ['Recall',       f'{safe_mean(rec_scores)*100:.2f}%'],
+    ['BLEU-1',       f'{safe_mean(bleu_scores[1])*100:.2f}%'],
+    ['BLEU-2',       f'{safe_mean(bleu_scores[2])*100:.2f}%'],
+    ['BLEU-3',       f'{safe_mean(bleu_scores[3])*100:.2f}%'],
+    ['BLEU-4',       f'{safe_mean(bleu_scores[4])*100:.2f}%'],
+    ['Accuracy (substring match)', f'{safe_mean(open_hits2)*100:.2f}%'],
+    ['N',             len(open_hits2)],
+]
+
+print('\n' + '='*50)
+print('  Result')
+print('='*50)
+print(tabulate(table, headers=['Metric', 'Score'], tablefmt='grid'))
