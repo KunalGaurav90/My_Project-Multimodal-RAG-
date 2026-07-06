@@ -1,0 +1,356 @@
+# ============================================================
+# CELL 9 — MKGF RAG INFERENCE (MODIFIED FOR MERGED_REPORTS + ACCURACY + IMPROVED RETRIEVAL/PROMPTING)
+# ============================================================
+
+import os, json, torch, gc
+import numpy as np
+from tqdm import tqdm
+from PIL import Image
+from transformers import AutoTokenizer
+from open_clip import create_model_from_pretrained
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
+from llava.conversation import conv_templates
+from llava.mm_utils import (
+    tokenizer_image_token, process_images, KeywordsStoppingCriteria
+)
+
+# ── Define paths ──────────────────────────────────────────────
+BASE_INPUT      = '/kaggle/input/datasets/ravvkunn09'
+MY_IMGS = os.path.join(BASE_INPUT, 'imagyy')
+MY_PATH = os.path.join(BASE_INPUT, 'm-report', 'merged_u.json')
+COLBERT_CKPT    = '/kaggle/working/colbert_trained_v2.pth'  # ← v2 from MedicalReportDataset training
+OUTPUT_DIR      = '/kaggle/working/outputs'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'🖥️  Device: {device}')
+
+# ── Ensure tokenizer & llava_model are available ─────────────
+if 'tokenizer' not in dir() or tokenizer is None:
+    print('⚠️  tokenizer not found — loading from MODEL_PATH...')
+    from transformers import AutoTokenizer as _AT
+    tokenizer = _AT.from_pretrained(MODEL_PATH, use_fast=False)
+    print('✅ Tokenizer loaded')
+
+if 'llava_model' not in dir() or llava_model is None:
+    print('⚠️  llava_model not found — loading in fp16...')
+    from llava.model.builder import load_pretrained_model
+    from llava.mm_utils import get_model_name_from_path
+    model_name = get_model_name_from_path(MODEL_PATH)
+    tokenizer, llava_model, image_processor, context_len = load_pretrained_model(
+        model_path  = MODEL_PATH,
+        model_base  = None,
+        model_name  = model_name,
+        device_map  = 'auto',
+        torch_dtype = torch.float16
+    )
+    llava_model.eval()
+    print('✅ LLaVA-Med loaded in fp16')
+
+# ── Fix tokenizer pad token ───────────────────────────────────
+if tokenizer.pad_token is None:
+    tokenizer.pad_token    = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+print(f'✅ pad_token set to: {tokenizer.pad_token}')
+
+# ── Suppress warnings ─────────────────────────────────────────
+import warnings, logging
+warnings.filterwarnings('ignore')
+logging.getLogger('transformers').setLevel(logging.ERROR)
+
+# ── 9a: Load ColBERT retriever ───────────────────────────────
+print('\n🔧 Loading ColBERT...')
+_, biomed_preprocess = create_model_from_pretrained(
+    'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+)
+biomed_tokenizer = AutoTokenizer.from_pretrained(
+    'microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext'
+)
+retriever = ColBERT().to(device)
+
+if os.path.exists(COLBERT_CKPT):
+    retriever.load_state_dict(torch.load(COLBERT_CKPT, map_location=device))
+    print(f'  ✅ Trained ColBERT loaded: {COLBERT_CKPT}')
+else:
+    print(f'  ⚠️  No checkpoint at {COLBERT_CKPT} — using untrained ColBERT')
+
+retriever.eval()
+
+# ── 9b: Load Knowledge Graph (merged_reports.json) ──────────
+print('\n📚 Loading Knowledge Graph...')
+with open(MY_PATH, 'r', encoding='utf-8') as f:
+    knowledge_graph = json.load(f)
+
+# Convert to KG format with 'chunk' field if not present
+for i, entity in enumerate(knowledge_graph):
+    if 'chunk' not in entity:
+        entity['chunk'] = entity.get('description', f"Medical report {i}")
+
+print(f'   ✅ Loaded {len(knowledge_graph)} entities')
+print(f'   Sample entity keys: {list(knowledge_graph[0].keys())}')
+
+# ── 9c: Pre-encode Knowledge Graph ───────────────────────────
+print('\n🔢 Encoding Knowledge Graph...')
+kg_embeddings = []
+with torch.no_grad():
+    for entity in tqdm(knowledge_graph, desc='KG encode'):
+        chunk_text = entity.get('chunk', entity.get('description', ''))
+        tok = biomed_tokenizer(
+            chunk_text, return_tensors='pt',
+            max_length=256, padding='max_length', truncation=True
+        )['input_ids'].to(device)
+        kg_embeddings.append(retriever.encode_text(tok).cpu())
+
+kg_matrix = torch.cat(kg_embeddings, dim=0)
+print(f'  ✅ KG matrix shape: {kg_matrix.shape}')
+
+# ── Helper functions ──────────────────────────────────────────
+def retrieve_top_k(query_text, k=8):
+    """Retrieve top-k entities from knowledge graph"""
+    tok = biomed_tokenizer(
+        query_text, return_tensors='pt', max_length=256,
+        padding='max_length', truncation=True
+    )['input_ids'].to(device)
+    with torch.no_grad():
+        q_emb = retriever.encode_text(tok).cpu()
+    sims = torch.nn.functional.cosine_similarity(q_emb, kg_matrix, dim=-1)
+    return sims.topk(min(k, len(sims))).indices.tolist()
+
+
+def rerank_multimodal(query_text, image_pil, top_indices):
+    """Rerank retrieved entities using multimodal scoring"""
+    q_tok = biomed_tokenizer(
+        query_text, return_tensors='pt', max_length=256,
+        padding='max_length', truncation=True
+    )['input_ids'].to(device)
+    q_img = biomed_preprocess(image_pil).unsqueeze(0).to(device)
+
+    scores = []
+    with torch.no_grad():
+        q_txt_emb = retriever.encode_text(q_tok)
+        q_img_emb = retriever.encode_image(q_img)
+
+        for idx in top_indices:
+            chunk_text = knowledge_graph[idx].get('chunk',
+                        knowledge_graph[idx].get('description', ''))
+            ent_tok = biomed_tokenizer(
+                chunk_text,
+                return_tensors='pt', max_length=256,
+                padding='max_length', truncation=True
+            )['input_ids'].to(device)
+            ent_emb = retriever.encode_text(ent_tok)
+            scores.append(torch.matmul(q_txt_emb, ent_emb.T).item())
+
+    # Return top 3 reranked indices
+    top3_positions = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True
+    )[:3]
+    return [top_indices[i] for i in top3_positions]
+
+
+def format_chunk_for_prompt(entry):
+    """Build a clean, structured snippet per retrieved entity instead of
+    dumping the entire raw 'chunk' (which mixes many fields together)."""
+    parts = []
+    if entry.get('entity'):
+        parts.append(f"Diagnosis: {entry['entity']}")
+    if entry.get('location'):
+        parts.append(f"Location: {entry['location']}")
+    if entry.get('symptom'):
+        parts.append(f"Symptoms: {entry['symptom']}")
+    if entry.get('description'):
+        parts.append(f"Description: {entry['description'][:150]}")
+    if not parts:
+        # fallback to raw chunk if none of the expected fields exist
+        parts.append(entry.get('chunk', ''))
+    return ' | '.join(parts)
+
+
+def build_prompt(question, chunks):
+    """Build prompt for LLaVA-Med — forces a clean, matchable answer format."""
+    context = '\n'.join(chunks)
+    return (
+        f'You are a medical imaging expert.\n'
+        f'Retrieved medical knowledge:\n{context}\n\n'
+        f'Question: {question}\n'
+        f'Respond in EXACTLY this format, nothing else:\n'
+        f'Diagnosis: <2-4 word diagnosis name only>\n'
+        f'Reasoning: <one short sentence>'
+    )
+
+
+def extract_diagnosis(pred_text):
+    """Pull out just the diagnosis line from the model's formatted output."""
+    for line in pred_text.split('\n'):
+        if line.strip().lower().startswith('diagnosis:'):
+            return line.split(':', 1)[1].strip()
+    return pred_text.strip()  # fallback if format wasn't followed
+
+
+# ── 9d: Inference Loop ───────────────────────────────────────
+print('\n🚀 Running inference...')
+print(f'   Total test samples: {len(knowledge_graph)}')
+
+results            = []
+predictions_data   = []
+hits               = []   # generation accuracy (entity name found in prediction)
+retrieval_hits     = []   # retrieval accuracy (correct entity actually retrieved)
+
+for item_idx, item in enumerate(tqdm(knowledge_graph, desc='Inference')):
+    try:
+        # Extract fields from merged_reports
+        image_name = item.get('image', f'image_{item_idx}.png')
+        entity     = item.get('entity', 'Unknown Disease')
+        location   = item.get('location', '')
+
+        # Create question — NOTE: entity name intentionally NOT included,
+        # otherwise the ground-truth answer leaks straight into the question.
+        question = f"What is the diagnosis shown in this {location} MRI image?"
+
+        # Ground truth (for comparison)
+        gt_answer = item.get('description', entity)
+
+        img_path = os.path.join(MY_IMGS, image_name)
+
+        if not os.path.exists(img_path):
+            print(f'  ⚠️  Image not found: {img_path}')
+            continue
+
+        # Load image
+        image_pil = Image.open(img_path).convert('RGB')
+
+        # ── Retrieval query: symptom/description cues only — NOT the entity
+        # name itself, otherwise retrieval just finds the item's own record.
+        retrieval_query = (
+            f"MRI findings in {location}: "
+            f"{item.get('symptom', '')[:100]} {item.get('description', '')[:100]}"
+        )
+        top_indices = retrieve_top_k(retrieval_query, k=8)
+
+        # Exclude the current item's own record from its candidate pool —
+        # otherwise it can retrieve (and leak) its own answer back to itself.
+        top_indices = [i for i in top_indices if knowledge_graph[i].get('image') != image_name]
+
+        final_idx = rerank_multimodal(retrieval_query, image_pil, top_indices)
+
+        # ── Retrieval-quality diagnostic (separate from generation accuracy) ──
+        retrieved_entities = [knowledge_graph[i].get('entity', '') for i in final_idx]
+        retrieval_hit = 1.0 if entity in retrieved_entities else 0.0
+        retrieval_hits.append(retrieval_hit)
+
+        # ── Build cleaner, structured chunks instead of raw mixed-field text ──
+        chunks = [format_chunk_for_prompt(knowledge_graph[i]) for i in final_idx]
+
+        # Build prompt
+        cur_prompt = build_prompt(question, chunks)
+        full_question = DEFAULT_IMAGE_TOKEN + '\n' + cur_prompt
+
+        # Prepare conversation
+        conv = conv_templates['mistral_instruct'].copy()
+        conv.append_message(conv.roles[0], full_question)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        # Tokenize
+        input_ids = tokenizer_image_token(
+            prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
+        ).unsqueeze(0).cuda()
+
+        # Attention mask
+        attention_mask = torch.ones_like(input_ids)
+
+        # Process images
+        image_tensor = process_images([image_pil], image_processor, llava_model.config)
+        if isinstance(image_tensor, list):
+            image_tensor = torch.stack(image_tensor)
+        image_tensor = image_tensor.half().cuda()
+
+        # Generate — shorter max_new_tokens since we want a concise formatted answer
+        with torch.inference_mode():
+            output_ids = llava_model.generate(
+                input_ids,
+                images=image_tensor,
+                attention_mask=attention_mask,
+                do_sample=False,
+                num_beams=1,
+                max_new_tokens=100,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+
+        # Decode prediction
+        pred = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+
+        # Extract just the diagnosis line for scoring (keeps raw `pred` too)
+        pred_clean = extract_diagnosis(pred)
+
+        # ── Accuracy check (substring match — entity name vs cleaned prediction) ──
+        gt_l    = gt_answer.lower().strip()
+        pred_l  = pred_clean.lower().strip()
+        is_hit  = 1.0 if entity.lower().strip() in pred_l else 0.0
+        hits.append(is_hit)
+
+        # Store result
+        results.append({
+            'image'            : image_name,
+            'entity'           : entity,
+            'location'         : location,
+            'question'         : question,
+            'gt_answer'        : gt_answer[:200],
+            'prediction'       : pred,          # full raw generation, for inspection
+            'prediction_clean' : pred_clean,    # cleaned diagnosis, used for scoring
+            'retrieved_chunks' : chunks[:3],
+            'retrieved_entities': retrieved_entities,
+            'retrieval_correct': bool(retrieval_hit),
+            'is_correct'       : bool(is_hit)
+        })
+
+        predictions_data.append({
+            'image'            : image_name,
+            'prediction'       : pred,
+            'prediction_clean' : pred_clean,
+            'retrieval_correct': bool(retrieval_hit),
+            'is_correct'       : bool(is_hit)
+        })
+
+    except Exception as e:
+        print(f'  ⚠️  Skipping {item.get("image", "?")} — {type(e).__name__}: {str(e)[:50]}')
+        continue
+
+# ── Save Results ──────────────────────────────────────────────
+print(f'\n📊 RESULTS:')
+print(f'   Total evaluated: {len(results)}')
+print(f'   Successful inferences: {len(results)}/{len(knowledge_graph)}')
+if hits:
+    print(f'   Generation Accuracy (entity match) : {sum(hits)/len(hits)*100:.2f}%  (n={len(hits)})')
+if retrieval_hits:
+    print(f'   Retrieval Accuracy (correct entity retrieved) : {sum(retrieval_hits)/len(retrieval_hits)*100:.2f}%  (n={len(retrieval_hits)})')
+
+# Save detailed results
+results_path = os.path.join(OUTPUT_DIR, 'mkgf_rag_results.json')
+with open(results_path, 'w') as f:
+    json.dump(results, f, indent=2)
+print(f'\n💾 Detailed results saved → {results_path}')
+
+# Save predictions
+predictions_path = os.path.join(OUTPUT_DIR, 'mkgf_predictions.json')
+with open(predictions_path, 'w') as f:
+    json.dump(predictions_data, f, indent=2)
+print(f'💾 Predictions saved → {predictions_path}')
+
+# Print sample results
+print(f'\n📋 Sample Results (first 3):')
+for i, res in enumerate(results[:3]):
+    print(f'\n  Result {i+1}:')
+    print(f'    Image: {res["image"]}')
+    print(f'    Entity: {res["entity"]}')
+    print(f'    Question: {res["question"][:80]}...')
+    print(f'    Prediction (raw): {res["prediction"][:150]}...')
+    print(f'    Prediction (clean): {res["prediction_clean"]}')
+    print(f'    Retrieval correct: {res["retrieval_correct"]}')
+    print(f'    Generation correct: {res["is_correct"]}')
+
+print(f'\n✅ Inference complete!')
