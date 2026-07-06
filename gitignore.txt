@@ -1,0 +1,34 @@
+# Model weights & checkpoints (large binaries — do not commit)
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+llava-med-v1.5-mistral-7b/
+colbert_trained*.pth
+
+# Kaggle / Jupyter artifacts
+.ipynb_checkpoints/
+/kaggle/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Data (MRI images / raw dataset — check licensing before ever committing)
+data/imagyy/
+data/*.png
+data/*.jpg
+data/*.dcm
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
