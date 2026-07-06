@@ -1,0 +1,27 @@
+
+# Core deep learning stack (Kaggle pre-installs torch; pin extras only)
+transformers==4.37.2
+accelerate==0.26.0
+bitsandbytes==0.41.3
+open_clip_torch==2.20.0
+peft
+einops
+ 
+# Retrieval / KG utilities
+huggingface_hub
+ 
+# Evaluation
+nltk
+tabulate
+ 
+# Data handling
+numpy
+pandas
+Pillow
+ 
+# Interactive inference widget (notebook only)
+ipywidgets
+ 
+# Note: LLaVA-Med itself is installed from its own repo (not on PyPI):
+#   git clone https://github.com/microsoft/LLaVA-Med
+# See README.md "Setup" section for the full sequence.
