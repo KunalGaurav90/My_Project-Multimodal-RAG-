@@ -1,0 +1,115 @@
+
+"""
+Defensive monkey-patches required to run open_clip_torch==2.20.0 against
+a newer PyTorch build (2.10) and against the BiomedCLIP checkpoint on
+Kaggle. Import and call `apply_all_patches()` once, before importing or
+using `open_clip` / `ColBERT`.
+ 
+Each patch documents the specific failure it works around
+(see Section 5 of the project report for the full write-up):
+ 
+1. torch_compat_patch      — missing internal torch attributes that
+                              open_clip expects to exist.
+2. clip_text_cfg_patch     — CLIPTextCfg dataclass field mismatch between
+                              the BiomedCLIP checkpoint and installed
+                              open_clip version.
+3. checkpoint_loader_patch — strips non-learnable 'position_ids' buffer
+                              keys that break strict state_dict loading.
+ 
+Extracted from the MKGF Kaggle notebook (Cells 6, 8, 11).
+"""
+ 
+import types
+ 
+ 
+def torch_compat_patch():
+    """Patch missing torch internals needed by open_clip."""
+    import torch
+    import torch.utils
+ 
+    if not hasattr(torch.utils, "_get_device_index"):
+ 
+        def _get_device_index(device, optional=False, allow_cpu=False):
+            if isinstance(device, int):
+                return device
+            if isinstance(device, torch.device):
+                return device.index if device.index is not None else torch.cuda.current_device()
+            return 0
+ 
+        torch.utils._get_device_index = _get_device_index
+ 
+    if not hasattr(torch, "_C"):
+        torch._C = types.ModuleType("torch._C")
+ 
+    if not hasattr(torch._C, "_get_cublas_allow_tf32"):
+        torch._C._get_cublas_allow_tf32 = lambda: False
+ 
+    if not hasattr(torch._C, "_is_any_autocast_enabled"):
+        torch._C._is_any_autocast_enabled = lambda: False
+ 
+    if not hasattr(torch, "_assert"):
+        torch._assert = lambda condition, message: None
+ 
+    print(f"Torch compatibility patches applied. PyTorch version: {torch.__version__}")
+ 
+ 
+def clip_text_cfg_patch():
+    """
+    Filter incoming kwargs against CLIPTextCfg's declared dataclass fields
+    and fall back to declared defaults for anything missing, so
+    construction is robust to version drift between the BiomedCLIP
+    checkpoint and the installed open_clip library.
+    """
+    import open_clip.model as _m
+    from dataclasses import fields, MISSING
+ 
+    def _safe_init(self, **kwargs):
+        valid_fields = {f.name for f in fields(_m.CLIPTextCfg)}
+        filtered = {k: v for k, v in kwargs.items() if k in valid_fields}
+        for f in fields(_m.CLIPTextCfg):
+            if f.name in filtered:
+                object.__setattr__(self, f.name, filtered[f.name])
+            elif f.default is not MISSING:
+                object.__setattr__(self, f.name, f.default)
+            elif f.default_factory is not MISSING:
+                object.__setattr__(self, f.name, f.default_factory())
+            else:
+                object.__setattr__(self, f.name, None)
+ 
+    _m.CLIPTextCfg.__init__ = _safe_init
+    print("CLIPTextCfg patched")
+ 
+ 
+def checkpoint_loader_patch():
+    """
+    Patch open_clip.factory.load_checkpoint to strip 'position_ids' keys
+    (a non-learnable buffer serialized by some checkpoint versions) before
+    loading, and load with strict=False so residual key mismatches don't
+    hard-fail the run.
+    """
+    import torch
+    import open_clip.factory as _factory
+ 
+    def _patched_load_checkpoint(model, checkpoint_path, strict=True, **kwargs):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+ 
+        keys_to_remove = [k for k in list(state_dict.keys()) if "position_ids" in k]
+        for k in keys_to_remove:
+            print(f"  Removing incompatible key: {k}")
+            del state_dict[k]
+ 
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys:
+            print(f"  Missing keys: {incompatible.missing_keys[:5]}")
+        print("Checkpoint loaded with strict=False")
+        return model
+ 
+    _factory.load_checkpoint = _patched_load_checkpoint
+    print("load_checkpoint patched")
+ 
+ 
+def apply_all_patches():
+    torch_compat_patch()
+    clip_text_cfg_patch()
+    checkpoint_loader_patch()
