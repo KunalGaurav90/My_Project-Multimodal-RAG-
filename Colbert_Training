@@ -1,0 +1,166 @@
+# ============================================================
+# OPTION 2: COLBERT TRAINING WITH MedicalReportDataset
+# (Advanced, More Q&A Pairs, Better Results - BEST PERFORMANCE)
+# ============================================================
+import os, torch
+from torch.utils.data import DataLoader, RandomSampler
+from transformers import AutoTokenizer
+from open_clip import create_model_from_pretrained
+from tqdm import tqdm
+
+# ── Define paths inline ──
+BASE_INPUT   = '/kaggle/input/datasets/ravvkunn09'
+MY_IMGS = os.path.join(BASE_INPUT, 'imagyy')
+MY_PATH = os.path.join(BASE_INPUT, 'm-report', 'merged_u.json')
+COLBERT_CKPT = '/kaggle/working/colbert_trained_v2.pth'
+
+# ── Apply both patches FIRST ──
+print("🔧 Applying patches...")
+exec(open('/kaggle/working/open_clip_patch.py').read())
+exec(open('/kaggle/working/statedict_patch.py').read())
+
+
+# ── Hyperparameters ──
+SKIP_TRAINING = False
+TRAIN_EPOCHS  = 20       # ← More epochs (450 samples, needs more training)
+BATCH_SIZE    = 32      # ← Smaller batch size (more updates per epoch)
+LR            = 1e-4
+
+# ── Setup device ──
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'\n🖥️  Device : {device}')
+if torch.cuda.is_available():
+    print(f'   GPU   : {torch.cuda.get_device_name(0)}')
+    print(f'   VRAM  : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')
+
+if SKIP_TRAINING and os.path.exists(COLBERT_CKPT):
+    print(f'\n⏭️  Checkpoint found — skipping training: {COLBERT_CKPT}')
+else:
+    print(f'\n📂 Loading BiomedCLIP and tokenizer...')
+    _, biomed_preprocess = create_model_from_pretrained(
+        'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224'
+    )
+    bio_tokenizer = AutoTokenizer.from_pretrained(
+        'microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext'
+    )
+
+    # ── Adapter: lets a plain HuggingFace tokenizer accept the
+    #    open_clip-style `context_length` kwarg that
+    #    MedicalReportDataset's tokenize() calls it with ──
+    class HFTokenizerAdapter:
+        def __init__(self, hf_tokenizer):
+            self.hf_tokenizer = hf_tokenizer
+        def __call__(self, texts, context_length=None, **kwargs):
+            return self.hf_tokenizer(
+                texts,
+                max_length=context_length,
+                truncation=True,
+                padding='max_length',
+                return_tensors='pt'
+            )['input_ids']
+
+    bio_tokenizer = HFTokenizerAdapter(bio_tokenizer)  # ← added
+
+    print(f'\n📊 Creating dataset...')
+    train_dataset = MedicalReportDataset(
+        json_path=MY_PATH,
+        images_dir=MY_IMGS,
+        preprocess=biomed_preprocess,
+        tokenizer=bio_tokenizer,
+        max_text_len=256
+    )
+    
+    print(f'✅ Dataset created: {len(train_dataset)} synthetic Q&A pairs')
+    
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=RandomSampler(train_dataset),
+        batch_size=BATCH_SIZE,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    print(f'\n🏗️  Building ColBERT model...')
+    colbert_model = ColBERT().to(device)
+    
+    # Freeze most parameters, only train projection layers
+    for name, param in colbert_model.named_parameters():
+        param.requires_grad = any(
+            k in name for k in ['text_linear', 'image_linear']
+        )
+    
+    trainable = sum(p.numel() for p in colbert_model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in colbert_model.parameters())
+    print(f'   Trainable : {trainable:,} / {total:,} params')
+
+    optimizer = torch.optim.AdamW(
+        [p for p in colbert_model.parameters() if p.requires_grad], lr=LR
+    )
+    criterion = torch.nn.KLDivLoss(reduction='batchmean')
+    colbert_model.train()
+    
+    print(f'\n🚀 Training for {TRAIN_EPOCHS} epoch(s)...\n')
+
+    epoch_losses = []
+    
+    for epoch in range(TRAIN_EPOCHS):
+        total_loss = 0.0
+        
+        for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{TRAIN_EPOCHS}'):
+            optimizer.zero_grad()
+            
+            q_ids  = batch['query_ids'].to(device)
+            q_img  = batch['query_image'].to(device)
+            p_ids  = batch['pos_ids'].to(device)
+            n_ids  = batch['neg_ids'].to(device)
+            
+            B, N, S = n_ids.shape if len(n_ids.shape) == 3 else (n_ids.shape[0], 1, n_ids.shape[1])
+            
+            # Encode query and positive text
+            q_text_feat = colbert_model.encode_text(q_ids)
+            p_text_feat = colbert_model.encode_text(p_ids)
+            
+            # Encode negative text
+            if len(n_ids.shape) == 3:
+                n_text_feat = colbert_model.encode_text(
+                    n_ids.view(B*N, S)).view(B, N, 512)
+            else:
+                n_text_feat = colbert_model.encode_text(n_ids).unsqueeze(1)
+            
+            # Compute similarity scores
+            pos_score  = (q_text_feat * p_text_feat).sum(-1, keepdim=True)
+            neg_score  = torch.bmm(n_text_feat, q_text_feat.unsqueeze(-1)).squeeze(-1)
+            all_scores = torch.cat([pos_score, neg_score], dim=1)
+            
+            # Create target distribution
+            target = torch.zeros_like(all_scores)
+            target[:, 0] = 1.0
+            
+            # Compute loss
+            loss = criterion(
+                torch.log_softmax(all_scores, dim=-1),
+                torch.softmax(target * 100, dim=-1)
+            )
+            
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        epoch_losses.append(avg_loss)
+        print(f'  Epoch {epoch+1} — Loss: {avg_loss:.4f}')
+
+    torch.save(colbert_model.state_dict(), COLBERT_CKPT)
+    print(f'\n✅ ColBERT (v2) saved → {COLBERT_CKPT}')
+    
+    del colbert_model, train_dataset, train_loader
+    torch.cuda.empty_cache()
+    
+    print(f'\n✅ Training complete!')
+    print(f'\n📊 Summary:')
+    print(f'   Dataset: MedicalReportDataset')
+    print(f'   Training samples: 450 synthetic Q&A pairs')
+    print(f'   Epochs: {TRAIN_EPOCHS}')
+    print(f'   Loss progression: {[f"{l:.4f}" for l in epoch_losses]}')
+    print(f'   Final loss: {epoch_losses[-1]:.4f}')
+    print(f'   Model saved: {COLBERT_CKPT}')
