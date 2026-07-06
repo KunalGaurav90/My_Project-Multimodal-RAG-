@@ -1,0 +1,39 @@
+🖼️  Image uploaded successfully
+[Image displayed here — saved as session_image_1.png]
+❓ Question: The image i have uploaded , what it is about?
+⏳ Running inference...
+
+🔎 Retrieved context from: ['Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma']
+
+💬 Answer:
+The image is a multimodal brain MRI, which is a type of magnetic resonance imaging that combines different imaging techniques to provide a more comprehensive view of the brain. In this case, the image is focused on the brain and is used to diagnose and assess the extent of a high-grade glioma, which is a type of brain tumor. The image helps healthcare professionals to visualize the tumor's location, size, and potential impact on surrounding brain structures.
+
+------------------------------------------------------------
+❓ Question: is the uploaded mri image infectious or not?
+⏳ Running inference...
+
+🔎 Retrieved context from: ['Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma']
+
+💬 Answer:
+The uploaded mri image is not infectious. it is a medical imaging study that provides information about the brain and helps in diagnosing various conditions, including glioblastoma multiforme and high-grade glioma.
+
+------------------------------------------------------------
+❓ Question: According to the mri image provided can the person do physical activity such as pushups?
+⏳ Running inference...
+
+🔎 Retrieved context from: ['Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma']
+
+💬 Answer:
+Diagnosis: Glioblastoma Multiforme / High-Grade Glioma
+Reasoning: The person may have difficulty performing physical activities like pushups due to the presence of a large, irregularly shaped central dark territory representing extensive peritumoral edema and mass effect. This mass effect can cause increased intracranial pressure and may affect the person's motor function, making it challenging to perform physical activities.
+
+------------------------------------------------------------
+❓ Question: Acoording to the mri image provided , what food items patient should consume?
+⏳ Running inference...
+
+🔎 Retrieved context from: ['Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma', 'Glioblastoma Multiforme / High-Grade Glioma']
+
+💬 Answer:
+The patient should consume a diet rich in fruits and vegetables.
+
+------------------------------------------------------------
